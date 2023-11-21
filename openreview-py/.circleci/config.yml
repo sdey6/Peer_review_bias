@@ -1,0 +1,159 @@
+version: 2.1
+orbs:
+  codecov: codecov/codecov@1.0.5
+
+parameters:
+  openreview-api-v1-branch:
+    type: string
+    default: "master"
+  openreview-api-v2-branch:
+    type: string
+    default: "main"
+
+jobs:
+  build:
+    parallelism: 10
+    working_directory: ~/openreview-py-repo
+    docker:
+      - image: cimg/python:3.7.14-node
+      - image: cimg/redis:6.2.6
+      - image: circleci/mongo:5.0.2
+        command: [--replSet,rs0]
+      - image: docker.elastic.co/elasticsearch/elasticsearch:7.7.0
+        environment:
+          xpack.security.enabled: false
+          transport.host: localhost
+    steps:
+      - checkout
+      - run:
+          name: Initialize Replica Set
+          command: |
+            wget -qO - https://www.mongodb.org/static/pgp/server-5.0.asc | sudo apt-key add -
+            sudo touch /etc/apt/sources.list.d/mongodb-org-5.0.list
+            echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu bionic/mongodb-org/5.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-5.0.list
+            sudo apt-get update
+            sudo apt-get install -y mongodb-org=5.0.13 mongodb-org-database=5.0.13 mongodb-org-server=5.0.13 mongodb-org-shell=5.0.13 mongodb-org-mongos=5.0.13 mongodb-org-tools=5.0.13
+            mongosh mongodb://localhost:27017 --eval "rs.initiate()"
+      - run: pip install ~/openreview-py-repo
+      - run: git clone https://$OPENREVIEW_GITHUB@github.com/openreview/openreview-api-v1.git ~/openreview
+      - run: cd ~/openreview && git checkout << pipeline.parameters.openreview-api-v1-branch >>
+      - run: git clone https://$OPENREVIEW_GITHUB@github.com/openreview/openreview-web.git ~/openreview-web
+      - run: git clone https://$OPENREVIEW_GITHUB@github.com/openreview/openreview-api.git ~/openreview-v2
+      - run: cd ~/openreview-v2 && git checkout << pipeline.parameters.openreview-api-v2-branch >>
+      - run: mkdir ~/openreview/logs
+      - run: mkdir ~/openreview/files
+      - run: mkdir ~/openreview/files/attachments
+      - run: mkdir ~/openreview/files/pdfs
+      - run: mkdir ~/openreview/files/temp
+      - run: mkdir ~/openreview-v2/logs
+      - run: mkdir ~/openreview-v2/files
+      - run: mkdir ~/openreview-v2/files/attachments
+      - run: mkdir ~/openreview-v2/files/pdfs
+      - run: mkdir ~/openreview-v2/files/temp
+      - run: mkdir ~/openreview-py-repo/coverage
+      - run:
+          name: install api
+          command: |
+            cd ~/openreview
+            npm install
+      - run:
+          name: run api
+          command: |
+            cd ~/openreview
+            NODE_ENV=circleci node scripts/clean_start_app.js
+          background: true
+      - run:
+          shell: /bin/sh
+          command: |
+            wget --retry-connrefused --waitretry=1 --read-timeout=20 --timeout=15 -t 10 http://localhost:3000
+            :
+      - run:
+          name: install web-app
+          command: |
+            cd ~/openreview-web
+            npm install
+            cp .env.example .env.local
+            NODE_ENV=production SUPER_USER=openreview.net npm run build
+      - run:
+          name: run web-app
+          command: |
+            cd ~/openreview-web
+            export NEXT_PORT=3030
+            NODE_ENV=production SUPER_USER=openreview.net npm run start
+          background: true
+      - run:
+          shell: /bin/sh
+          command: |
+            wget --retry-connrefused --waitretry=5 --read-timeout=20 --timeout=15 -t 10 http://localhost:3030
+            :
+      - run:
+          name: install api-v2
+          command: |
+            cd ~/openreview-v2
+            npm install
+      - run:
+          name: run api-v2
+          command: |
+            cd ~/openreview-v2
+            NODE_ENV=circleci node scripts/setup_app.js
+          background: true
+      - run:
+          shell: /bin/sh
+          command: |
+            wget --retry-connrefused --waitretry=1 --read-timeout=20 --timeout=15 -t 10 http://localhost:3001
+            :
+      - run:
+          name: install firefox driver
+          command: |
+            sudo apt-get update
+            sudo apt-get install firefox
+            cd ~/openreview-py-repo/tests/drivers
+            wget https://github.com/mozilla/geckodriver/releases/download/v0.30.0/geckodriver-v0.30.0-linux64.tar.gz
+            tar -xvzf geckodriver*
+            chmod +x geckodriver
+      - run:
+          name: run tests
+          command: |
+            cd ~/openreview-py-repo
+            pip install -U pytest
+            pip install selenium==4.2.0
+            pip install pytest-selenium
+            pip install pytest-cov
+            pip install codecov
+            pip install -e .
+            TEST_FILES=$(circleci tests glob "tests/test_*.py" | circleci tests split --split-by=timings)
+            mkdir test-reports
+            pytest --junitxml=test-reports/junit.xml --driver Firefox --driver-path tests/drivers/geckodriver --cov-report xml:~/openreview-py-repo/coverage/cov.xml --cov=./ $TEST_FILES
+      - codecov/upload:
+          file: "~/openreview-py-repo/coverage/cov.xml"
+      - store_test_results:
+          path: test-reports
+      - store_artifacts:
+          path: test-reports
+  deploy:
+    working_directory: ~/openreview-py-repo
+    docker:
+      - image: cimg/python:3.7.14-node
+    steps:
+      - checkout
+      - run:
+          name: Deploy to pip
+          command: |
+            pip install twine
+            python setup.py bdist_wheel --universal
+            twine upload dist/* --skip-existing
+      - run:
+          name: Deploy to dev instance
+          command: |
+            curl -X POST -H "Accept: application/vnd.github.v3+json" -H "Authorization: Bearer $OPENREVIEW_GITHUB" https://api.github.com/repos/openreview/openreview-py/dispatches -d '{"event_type":"openreview-py-updated"}'
+workflows:
+  version: 2
+  build-deploy:
+    jobs:
+      - build
+      - deploy:
+          requires:
+            - build
+          filters:
+            branches:
+              only: master
